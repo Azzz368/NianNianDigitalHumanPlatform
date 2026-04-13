@@ -1,0 +1,49 @@
+{
+  "family_memory_text": "爷爷叫张建国，1948年5月12日出生在山东，2023年10月25日去世，享年75岁。追悼会定于10月29日在XX殡仪馆告别厅举行。爷爷最让我们记住的事，是他退休后每天早上5点起床为全家煮小米粥，坚持了40年。还有一件事是他退休后自学木工，亲手为孙女打了一套儿童家具。爷爷参过军，1970年入伍，服役10年。1985年还被评为单位先进工作者。遗愿是希望家人身体健康，孙女能考上好大学。主要致辞人是女儿张敏，偏好温和真诚的风格。",
+  "uploaded_assets": [
+    {
+      "asset_id": "photo_01",
+      "type": "portrait",
+      "description": "2018年全家合影，爷爷坐在中间，戴银框眼镜，穿深灰色中山装",
+      "time_period": "2010s"
+    },
+    {
+      "asset_id": "photo_03",
+      "type": "scene",
+      "description": "爷爷在厨房煮粥的照片",
+      "time_period": "2015"
+    },
+    {
+      "asset_id": "photo_05",
+      "type": "scene",
+      "description": "爷爷在院子里做木工",
+      "time_period": "2020"
+    },
+    {
+      "asset_id": "video_01",
+      "type": "video_clip",
+      "description": "爷爷帮孙女安装家具的视频",
+      "time_period": "2021"
+    },
+    {
+      "asset_id": "audio_01",
+      "type": "voice_sample",
+      "description": "爷爷70岁生日时的讲话录音",
+      "duration_sec": 120
+    }
+  ],
+  "style_preference": "warm_nostalgia",
+  "emotional_intensity": "moderate",
+  "ceremony_type": "family_memorial",
+  "ceremony_date": "2023-10-29",
+  "total_duration_sec": 330,
+  "relatives": [
+    {
+      "relation": "daughter",
+      "name": "张敏",
+      "is_main_speaker": true,
+      "speech_preference": "gentle_and_sincere"
+    }
+  ],
+  "last_wishes": "希望家人身体健康，孙女能考上好大学"
+}

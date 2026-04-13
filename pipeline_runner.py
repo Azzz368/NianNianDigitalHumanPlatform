@@ -1,0 +1,137 @@
+import json
+import time
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import gate_manager
+from llm_client import call_skill
+from skill_loader import load_skill
+
+BASE_DIR = Path(__file__).resolve().parent
+SKILLS_DIR = BASE_DIR / "skills"
+OUTPUTS_DIR = BASE_DIR / "outputs"
+OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+
+MV_ORDER = ["MV01", "MV02", "MV03", "MV04", "MV05", "MV06"]
+
+MV_FILES = {
+    "MV01": "MV01-interview.md",
+    "MV02": "MV02-validation.md",
+    "MV03": "MV03-storyboard.md",
+    "MV04": "MV04-bible-lock.md",
+    "MV05": "MV05-avatar-render.md",
+    "MV06": "MV06-final-cut.md",
+}
+
+mv_state: Dict[str, Dict[str, Any]] = {
+    mv_id: {"status": "pending", "duration_sec": None, "error": None}
+    for mv_id in MV_ORDER
+}
+
+
+def reset_state() -> None:
+    for mv_id in MV_ORDER:
+        mv_state[mv_id] = {"status": "pending", "duration_sec": None, "error": None}
+    gate_manager.reset_from(MV_ORDER[0])
+
+
+def get_status() -> Dict[str, Any]:
+    return json.loads(json.dumps(mv_state))
+
+
+def _output_path(mv_id: str) -> Path:
+    return OUTPUTS_DIR / f"{mv_id.lower()}.json"
+
+
+def read_output(mv_id: str) -> Dict[str, Any]:
+    path = _output_path(mv_id)
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _write_output(mv_id: str, payload: Dict[str, Any]) -> None:
+    path = _output_path(mv_id)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_prompt(mv_id: str) -> str:
+    skill_path = SKILLS_DIR / MV_FILES[mv_id]
+    return load_skill(str(skill_path))
+
+
+def _set_state(
+    mv_id: str,
+    status: str,
+    duration: Optional[float] = None,
+    error: Optional[str] = None,
+) -> None:
+    mv_state[mv_id]["status"] = status
+    mv_state[mv_id]["duration_sec"] = duration
+    mv_state[mv_id]["error"] = error
+
+
+def build_payload(mv_id: str, mv01_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if mv_id == "MV01":
+        return mv01_input or {}
+    prev_index = MV_ORDER.index(mv_id) - 1
+    prev_mv = MV_ORDER[prev_index]
+    return read_output(prev_mv)
+
+
+def run_step(mv_id: str, mv01_input: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if mv_id not in MV_ORDER:
+        raise ValueError(f"Unknown mv_id: {mv_id}")
+    if not gate_manager.can_run(mv_id):
+        return {"error": True, "skill": mv_id, "message": "上一步未通过审核"}
+
+    gate_manager.set_running(mv_id)
+    _set_state(mv_id, "running", None, None)
+    start = time.perf_counter()
+
+    try:
+        prompt = _load_prompt(mv_id)
+        payload = build_payload(mv_id, mv01_input)
+        result = call_skill(mv_id, prompt, payload)
+    except Exception as exc:  # pragma: no cover
+        result = {"error": True, "skill": mv_id, "message": str(exc)}
+
+    duration = time.perf_counter() - start
+    if result.get("error"):
+        _set_state(mv_id, "error", duration, result.get("message"))
+        gate_manager.reject(mv_id, {"error": result.get("message")})
+        _write_output(mv_id, {})
+        return result
+
+    _write_output(mv_id, result)
+    _set_state(mv_id, "awaiting_review", duration, None)
+    gate_manager.set_awaiting_review(mv_id)
+    return result
+
+
+def rerun_partial(mv_id: str, scope: Dict[str, Any], prev_output: Dict[str, Any]) -> Dict[str, Any]:
+    if mv_id not in MV_ORDER:
+        raise ValueError(f"Unknown mv_id: {mv_id}")
+
+    gate_manager.set_running(mv_id)
+    _set_state(mv_id, "running", None, None)
+    start = time.perf_counter()
+
+    try:
+        prompt = _load_prompt(mv_id)
+        payload = {"scope": scope, "previous_output": prev_output}
+        result = call_skill(mv_id, prompt, payload)
+    except Exception as exc:  # pragma: no cover
+        result = {"error": True, "skill": mv_id, "message": str(exc)}
+
+    duration = time.perf_counter() - start
+    if result.get("error"):
+        _set_state(mv_id, "error", duration, result.get("message"))
+        gate_manager.reject(mv_id, scope)
+        return result
+
+    merged = {**prev_output, **result}
+    _write_output(mv_id, merged)
+    _set_state(mv_id, "awaiting_review", duration, None)
+    gate_manager.set_awaiting_review(mv_id)
+    return merged
