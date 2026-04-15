@@ -9,9 +9,11 @@
 
 ## 准备工作
 1. 复制技能 Prompt 文件到 `skills/`（项目不自带）
-2. 复制并填写环境变量：
-   - `OPENAI_API_KEY`
-   - 可选：`OPENAI_BASE_URL`、`OPENAI_MODEL`
+2. 复制并填写环境变量（默认支持 LM Studio + OpenRouter 备选）：
+  - `OPENAI_API_KEY`（LM Studio 通常可填写 `lm-studio`）
+  - `OPENAI_BASE_URL`（如 `http://localhost:1234/v1`）
+  - `OPENAI_MODEL`（如 `qwen3.5:9b`）
+  - 可选：`OPENAI_FALLBACK_BASE_URL`、`OPENAI_FALLBACK_API_KEY`、`OPENAI_FALLBACK_MODELS`
 
 ## 运行
 - 安装依赖并启动：

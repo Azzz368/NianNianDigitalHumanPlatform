@@ -55,9 +55,21 @@ def _write_output(mv_id: str, payload: Dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def save_output(mv_id: str, payload: Dict[str, Any]) -> None:
+    if mv_id not in MV_ORDER:
+        raise ValueError(f"Unknown mv_id: {mv_id}")
+    _write_output(mv_id, payload)
+
+
 def _load_prompt(mv_id: str) -> str:
     skill_path = SKILLS_DIR / MV_FILES[mv_id]
     return load_skill(str(skill_path))
+
+
+def get_skill_prompt(mv_id: str) -> str:
+    if mv_id not in MV_ORDER:
+        raise ValueError(f"Unknown mv_id: {mv_id}")
+    return _load_prompt(mv_id)
 
 
 def _set_state(
@@ -135,3 +147,28 @@ def rerun_partial(mv_id: str, scope: Dict[str, Any], prev_output: Dict[str, Any]
     _set_state(mv_id, "awaiting_review", duration, None)
     gate_manager.set_awaiting_review(mv_id)
     return merged
+
+
+def run_mv03_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    mv_id = "MV03"
+    gate_manager.set_running(mv_id)
+    _set_state(mv_id, "running", None, None)
+    start = time.perf_counter()
+
+    try:
+        prompt = _load_prompt(mv_id)
+        result = call_skill(mv_id, prompt, payload)
+    except Exception as exc:  # pragma: no cover
+        result = {"error": True, "skill": mv_id, "message": str(exc)}
+
+    duration = time.perf_counter() - start
+    if result.get("error"):
+        _set_state(mv_id, "error", duration, result.get("message"))
+        gate_manager.reject(mv_id, {"error": result.get("message")})
+        _write_output(mv_id, {})
+        return result
+
+    _write_output(mv_id, result)
+    _set_state(mv_id, "awaiting_review", duration, None)
+    gate_manager.set_awaiting_review(mv_id)
+    return result

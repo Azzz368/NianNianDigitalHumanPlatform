@@ -1,14 +1,16 @@
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+import copy
+from PIL import Image
 
 import streamlit as st
+from streamlit_cropper import st_cropper
 
 import gate_manager
 import pipeline_runner
-
-BASE_DIR = Path(__file__).resolve().parent
-SAMPLE_PATH = BASE_DIR / "sample_inputs" / "sample_interview.json"
+import comfyui_client
+from llm_client import call_freeform, call_structured
 
 MV_STEPS = [
     {"id": "MV01", "name": "MV01 家属访谈结构化"},
@@ -34,32 +36,38 @@ st.markdown(
     """
 <style>
 /* 引用类似 LegacyRemembered 的字体与极简风格 */
-@import url('https://fonts.googleapis.com/css2?family=Lato:wght@400;700&family=Noto+Sans+SC:wght@400;500;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Lato:wght@400;700&family=Playfair+Display:ital,wght@0,400;0,600;0,700;1,400&family=Noto+Sans+SC:wght@400;500;700&display=swap');
 
 html, body, [class*="css"] {
     font-family: 'Lato', 'Noto Sans SC', sans-serif !important;
+    font-size: 16px;
+    line-height: 1.5rem;
+}
+
+h1, h2, h3, .font-heading {
+    font-family: 'Playfair Display', 'Noto Serif SC', serif !important;
 }
 
 /* 背景与排版重置 */
 .stApp {
-    background-color: #Fdfdfc;
+    background-color: #FFFFFF;
     color: #232425;
 }
 
 /* 卡片样式，参考前端交互审计 (.hover-card) */
 .mv-card {
-    padding: 20px 24px;
-    border-radius: 12px;
+    padding: 24px;
+    border-radius: 16px;
     background: #FFFFFF;
     border: 1px solid rgba(0,0,0,0.06);
-    margin-bottom: 20px;
-    box-shadow: 0px 2px 4px -1px rgba(0,0,0,0.02);
+    margin-bottom: 24px;
+    box-shadow: 0px 4px 12px rgba(0,0,0,0.03);
     transition: all 300ms cubic-bezier(0.4, 0, 0.2, 1);
 }
 .mv-card:hover {
-    box-shadow: 0px 4px 12px rgba(0,0,0,0.06);
-    transform: translateY(-2px);
-    border-color: rgba(0,0,0,0.1);
+    box-shadow: 0px 8px 24px rgba(0,0,0,0.08);
+    transform: translateY(-4px);
+    border-color: rgba(0,0,0,0.12);
 }
 
 /* 卡片头部 */
@@ -67,7 +75,7 @@ html, body, [class*="css"] {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin-bottom: 12px;
+    margin-bottom: 16px;
     border-bottom: 1px solid #f0f0f0;
     padding-bottom: 12px;
 }
@@ -75,14 +83,14 @@ html, body, [class*="css"] {
     margin: 0;
     font-weight: 600;
     color: #111111;
-    font-size: 1.1rem;
+    font-size: 1.25rem;
 }
 
 /* 标签胶囊样式 (.mv-pill) */
 .mv-pill {
-    padding: 4px 12px;
+    padding: 6px 14px;
     border-radius: 999px;
-    background: #f3f4f6;
+    background: #f8f9fa;
     font-size: 13px;
     font-weight: 500;
     color: #4b5563;
@@ -93,18 +101,19 @@ html, body, [class*="css"] {
 div.stButton > button {
     border-radius: 8px !important;
     font-weight: 600 !important;
+    padding: 0.5rem 1rem !important;
     transition: all 150ms cubic-bezier(0.4, 0, 0.2, 1) !important;
 }
 
 /* 品牌主色调按钮 (Primary Button) */
 div.stButton > button[kind="primary"] {
-    background-color: #111111 !important;
+    background-color: #0F7FFF !important;
     color: #FFFFFF !important;
-    border: 1px solid #111111 !important;
+    border: 1px solid #0F7FFF !important;
 }
 div.stButton > button[kind="primary"]:hover {
-    background-color: #333333 !important;
-    border-color: #333333 !important;
+    background-color: #0B61C4 !important;
+    border-color: #0B61C4 !important;
 }
 
 /* 次要按钮弱化 */
@@ -120,19 +129,399 @@ div.stButton > button[kind="secondary"]:hover {
 }
 
 /* 输入框和 Expander 弱化边框 */
-.stTextInput > div > div > input {
-    border-radius: 6px;
+.stTextInput > div > div > input,
+.stNumberInput > div > div > input,
+.stTextArea > div > div > textarea {
+    border-radius: 8px;
     border: 1px solid #e5e7eb;
+    background-color: #fafafa;
+    transition: border-color 150ms ease-in-out;
 }
+.stTextInput > div > div > input:focus,
+.stNumberInput > div > div > input:focus,
+.stTextArea > div > div > textarea:focus {
+    border-color: #0F7FFF;
+    background-color: #ffffff;
+}
+
 .streamlit-expanderHeader {
     font-weight: 500;
     color: #374151;
+    border-radius: 8px;
+}
+div[data-testid="stExpander"] {
+    border: 1px solid #e5e7eb !important;
+    border-radius: 12px !important;
 }
 
+/* Tabs */
+.stTabs [data-baseweb="tab-list"] {
+    gap: 24px;
+}
+.stTabs [data-baseweb="tab"] {
+    height: 50px;
+    white-space: pre-wrap;
+    background-color: transparent;
+    border-radius: 0;
+    color: #4b5563;
+    font-weight: 500;
+}
+.stTabs [aria-selected="true"] {
+    color: #111111;
+    border-bottom: 2px solid #0F7FFF;
+}
 </style>
 """,
     unsafe_allow_html=True,
 )
+
+BASE_DIR = Path(__file__).resolve().parent
+SAMPLE_PATH = BASE_DIR / "sample_inputs" / "sample_interview.json"
+COMFYUI_WORKFLOW_DIR = BASE_DIR.parent / "ComfyUIJson"
+
+COMFYUI_WORKFLOWS = {
+    "Flux2 文生图 9B": {
+        "file": "image_flux2_text_to_image_9b.json",
+        "type": "image",
+        "nodes": {
+            "prompt": "76",
+            "negative": "75:67",
+            "width": "75:68",
+            "height": "75:69",
+            "steps": "75:62",
+            "cfg": "75:63",
+            "sampler": "75:61",
+            "seed": "75:73",
+        },
+    },
+    "Flux2 参考图编辑 9B": {
+        "file": "image_flux2_klein_image_edit_9b_base.json",
+        "type": "image",
+        "nodes": {
+            "prompt": "92:113",
+            "negative": "92:87",
+            "cfg": "92:114",
+            "steps": "92:115",
+            "sampler": "92:102",
+            "seed": "92:105",
+            "source_image": "76",
+            "reference_image": "81",
+        },
+    },
+    "LTX 2.3 视频 T2V": {
+        "file": "video_ltx2_3_t2v.json",
+        "type": "video",
+        "nodes": {
+            "prompt": "267:266",
+            "negative": "267:247",
+            "width": "267:257",
+            "height": "267:258",
+            "cfg": ["267:213", "267:231"],
+            "sampler": ["267:246", "267:209"],
+            "seed": ["267:216", "267:237"],
+            "lora_strength": "267:232",
+        },
+    },
+    "LTX 2.3 视频 I2V": {
+        "file": "video_ltx2_3_i2v.json",
+        "type": "video",
+        "nodes": {
+            "prompt": "267:266",
+            "negative": "267:247",
+            "width": "267:257",
+            "height": "267:258",
+            "cfg": ["267:213", "267:231"],
+            "sampler": ["267:246", "267:209"],
+            "seed": ["267:216", "267:237"],
+            "lora_strength": "267:232",
+            "source_image": "269",
+        },
+    },
+}
+
+MV03_STANDALONE_SAMPLE = {
+    "family_memory_text": "爷爷叫张建国，1948年5月12日出生在山东，2023年10月25日去世，享年75岁。追悼会定于10月29日在XX殡仪馆告别厅举行。爷爷最让我们记住的事，是他退休后每天早上5点起床为全家煮小米粥，坚持了40年。还有一件事是他退休后自学木工，亲手为孙女打了一套儿童家具。爷爷参过军，1970年入伍，服役10年。1985年还被评为单位先进工作者。遗愿是希望家人身体健康，孙女能考上好大学。主要致辞人是女儿张敏，偏好温和真诚的风格。",
+    "uploaded_assets": [
+        {
+            "asset_id": "photo_01",
+            "type": "portrait",
+            "description": "2018年全家合影，爷爷坐在中间，戴银框眼镜，穿深灰色中山装",
+            "time_period": "2010s",
+        },
+        {
+            "asset_id": "photo_03",
+            "type": "scene",
+            "description": "爷爷在厨房煮粥的照片",
+            "time_period": "2015",
+        },
+        {
+            "asset_id": "photo_05",
+            "type": "scene",
+            "description": "爷爷在院子里做木工",
+            "time_period": "2020",
+        },
+        {
+            "asset_id": "video_01",
+            "type": "video_clip",
+            "description": "爷爷帮孙女安装家具的视频",
+            "time_period": "2021",
+        },
+        {
+            "asset_id": "audio_01",
+            "type": "voice_sample",
+            "description": "爷爷70岁生日时的讲话录音",
+            "duration_sec": 120,
+        },
+    ],
+    "style_preference": "warm_nostalgia",
+    "emotional_intensity": "moderate",
+    "ceremony_type": "family_memorial",
+    "ceremony_date": "2023-10-29",
+    "total_duration_sec": 330,
+    "relatives": [
+        {
+            "relation": "daughter",
+            "name": "张敏",
+            "is_main_speaker": True,
+            "speech_preference": "gentle_and_sincere",
+        }
+    ],
+    "last_wishes": "希望家人身体健康，孙女能考上好大学",
+}
+
+
+def load_comfyui_workflow(file_name: str) -> Dict[str, Any]:
+    workflow_path = COMFYUI_WORKFLOW_DIR / file_name
+    if not workflow_path.exists():
+        st.error(f"找不到工作流文件：{workflow_path}")
+        return {}
+    return json.loads(workflow_path.read_text(encoding="utf-8"))
+
+
+def _get_node(workflow: Dict[str, Any], node_id: str) -> Dict[str, Any]:
+    node = workflow.get(node_id, {})
+    if isinstance(node, dict):
+        return node
+    return {}
+
+
+def _get_input_value(workflow: Dict[str, Any], node_id: str, key: str, default: Any) -> Any:
+    node = _get_node(workflow, node_id)
+    return node.get("inputs", {}).get(key, default)
+
+
+def get_workflow_defaults(workflow: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
+    nodes = config["nodes"]
+    defaults: Dict[str, Any] = {}
+    prompt_node = nodes.get("prompt")
+    if prompt_node:
+        defaults["prompt"] = _get_input_value(workflow, prompt_node, "value", "")
+        if defaults["prompt"] == "":
+            defaults["prompt"] = _get_input_value(workflow, prompt_node, "text", "")
+    negative_node = nodes.get("negative")
+    if negative_node:
+        defaults["negative"] = _get_input_value(workflow, negative_node, "text", "")
+    width_node = nodes.get("width")
+    if width_node:
+        defaults["width"] = _get_input_value(workflow, width_node, "value", 1280)
+    height_node = nodes.get("height")
+    if height_node:
+        defaults["height"] = _get_input_value(workflow, height_node, "value", 720)
+    steps_node = nodes.get("steps")
+    if steps_node:
+        defaults["steps"] = _get_input_value(workflow, steps_node, "steps", 20)
+    cfg_nodes = nodes.get("cfg")
+    if cfg_nodes:
+        target = cfg_nodes[0] if isinstance(cfg_nodes, list) else cfg_nodes
+        defaults["cfg"] = _get_input_value(workflow, target, "cfg", 5)
+    sampler_nodes = nodes.get("sampler")
+    if sampler_nodes:
+        target = sampler_nodes[0] if isinstance(sampler_nodes, list) else sampler_nodes
+        defaults["sampler"] = _get_input_value(workflow, target, "sampler_name", "euler")
+    seed_nodes = nodes.get("seed")
+    if seed_nodes:
+        target = seed_nodes[0] if isinstance(seed_nodes, list) else seed_nodes
+        defaults["seed"] = _get_input_value(workflow, target, "noise_seed", 42)
+    lora_node = nodes.get("lora_strength")
+    if lora_node:
+        defaults["lora_strength"] = _get_input_value(workflow, lora_node, "strength_model", 0.5)
+    source_image_node = nodes.get("source_image")
+    if source_image_node:
+        defaults["source_image"] = _get_input_value(workflow, source_image_node, "image", "")
+    ref_image_node = nodes.get("reference_image")
+    if ref_image_node:
+        defaults["reference_image"] = _get_input_value(workflow, ref_image_node, "image", "")
+    return defaults
+
+
+def apply_workflow_inputs(workflow: Dict[str, Any], config: Dict[str, Any], values: Dict[str, Any]) -> Dict[str, Any]:
+    updated = copy.deepcopy(workflow)
+    nodes = config["nodes"]
+
+    def update_nodes(node_ids: Any, key: str, value: Any) -> None:
+        if not node_ids:
+            return
+        targets = node_ids if isinstance(node_ids, list) else [node_ids]
+        for node_id in targets:
+            node = updated.get(node_id)
+            if not isinstance(node, dict):
+                continue
+            node.setdefault("inputs", {})[key] = value
+
+    prompt_node = nodes.get("prompt")
+    if prompt_node:
+        node = updated.get(prompt_node, {})
+        if node.get("class_type") in {"PrimitiveString", "PrimitiveStringMultiline"}:
+            update_nodes(prompt_node, "value", values.get("prompt", ""))
+        else:
+            update_nodes(prompt_node, "text", values.get("prompt", ""))
+
+    update_nodes(nodes.get("negative"), "text", values.get("negative", ""))
+    update_nodes(nodes.get("width"), "value", values.get("width"))
+    update_nodes(nodes.get("height"), "value", values.get("height"))
+    update_nodes(nodes.get("steps"), "steps", values.get("steps"))
+    update_nodes(nodes.get("cfg"), "cfg", values.get("cfg"))
+    update_nodes(nodes.get("sampler"), "sampler_name", values.get("sampler"))
+    update_nodes(nodes.get("seed"), "noise_seed", values.get("seed"))
+    update_nodes(nodes.get("lora_strength"), "strength_model", values.get("lora_strength"))
+    update_nodes(nodes.get("source_image"), "image", values.get("source_image"))
+    update_nodes(nodes.get("reference_image"), "image", values.get("reference_image"))
+
+    return updated
+
+
+def render_comfyui_panel() -> None:
+    st.markdown("## ComfyUI 生成中心")
+    st.caption("连接同一 WiFi 的 5090 主机 ComfyUI，直接调用已准备的工作流。")
+
+    host = st.text_input(
+        "ComfyUI 节点地址",
+        value=st.session_state.get("comfyui_host", "http://10.79.65.44:8188/"),
+        help="支持输入 IP 或完整 URL，默认端口 8188。",
+    )
+    st.session_state["comfyui_host"] = host
+
+    workflow_name = st.selectbox("选择工作流", list(COMFYUI_WORKFLOWS.keys()))
+    workflow_config = COMFYUI_WORKFLOWS[workflow_name]
+    workflow = load_comfyui_workflow(workflow_config["file"])
+    defaults = get_workflow_defaults(workflow, workflow_config)
+
+    with st.form("comfyui_form", clear_on_submit=False):
+        prompt = st.text_area("Prompt", value=defaults.get("prompt", ""), height=140)
+        negative = st.text_area("Negative Prompt", value=defaults.get("negative", ""), height=90)
+        cols = st.columns(4)
+        width = cols[0].number_input("宽度", value=int(defaults.get("width", 1280)), step=64)
+        height = cols[1].number_input("高度", value=int(defaults.get("height", 720)), step=64)
+        steps = cols[2].number_input("步数", value=int(defaults.get("steps", 20)), step=1)
+        cfg = cols[3].number_input("CFG", value=float(defaults.get("cfg", 5)), step=0.5)
+
+        sampler = st.text_input("采样器", value=str(defaults.get("sampler", "euler")))
+        seed = st.number_input("随机种子", value=int(defaults.get("seed", 42)), step=1)
+
+        lora_strength = None
+        if "lora_strength" in defaults:
+            lora_strength = st.slider("LoRA 强度", 0.0, 1.0, float(defaults.get("lora_strength", 0.5)), 0.05)
+
+        source_upload = None
+        source_image = None
+        if "source_image" in defaults:
+            st.markdown("**参考图一（源图）**")
+            source_upload_raw = st.file_uploader("上传图一", type=["png", "jpg", "jpeg"], key="comfy_source")
+            if source_upload_raw is not None:
+                st.caption("裁剪源图：")
+                img = Image.open(source_upload_raw)
+                cropped_img = st_cropper(img, realtime_update=True, box_color='#0F7FFF', aspect_ratio=None, key="cropper_source")
+                if cropped_img:
+                    import io
+                    buf = io.BytesIO()
+                    cropped_img.save(buf, format="PNG")
+                    buf.name = source_upload_raw.name
+                    source_upload = buf
+            source_image = st.text_input("或填写图一文件名", value=str(defaults.get("source_image", "")))
+
+        reference_upload = None
+        reference_image = None
+        if "reference_image" in defaults:
+            st.markdown("**参考图二（风格/目标）**")
+            reference_upload_raw = st.file_uploader("上传图二", type=["png", "jpg", "jpeg"], key="comfy_reference")
+            if reference_upload_raw is not None:
+                st.caption("裁剪参考图：")
+                img2 = Image.open(reference_upload_raw)
+                cropped_img2 = st_cropper(img2, realtime_update=True, box_color='#0F7FFF', aspect_ratio=None, key="cropper_ref")
+                if cropped_img2:
+                    import io
+                    buf2 = io.BytesIO()
+                    cropped_img2.save(buf2, format="PNG")
+                    buf2.name = reference_upload_raw.name
+                    reference_upload = buf2
+            reference_image = st.text_input("或填写图二文件名", value=str(defaults.get("reference_image", "")))
+
+        submitted = st.form_submit_button("提交渲染任务")
+
+    if submitted:
+        try:
+            if source_upload is not None:
+                source_image = comfyui_client.upload_image(
+                    host,
+                    source_upload.getvalue(),
+                    source_upload.name,
+                )
+            if reference_upload is not None:
+                reference_image = comfyui_client.upload_image(
+                    host,
+                    reference_upload.getvalue(),
+                    reference_upload.name,
+                )
+        except Exception as exc:
+            st.error(f"上传参考图失败：{exc}")
+            return
+
+        payload_values = {
+            "prompt": prompt,
+            "negative": negative,
+            "width": width,
+            "height": height,
+            "steps": steps,
+            "cfg": cfg,
+            "sampler": sampler,
+            "seed": seed,
+            "lora_strength": lora_strength,
+            "source_image": source_image,
+            "reference_image": reference_image,
+        }
+        workflow_payload = apply_workflow_inputs(workflow, workflow_config, payload_values)
+        try:
+            prompt_id = comfyui_client.submit_prompt(host, workflow_payload)
+            st.session_state["comfyui_prompt_id"] = prompt_id
+            st.success(f"任务已提交，Prompt ID: {prompt_id}")
+        except Exception as exc:
+            st.error(f"提交失败：{exc}")
+
+    prompt_id = st.session_state.get("comfyui_prompt_id")
+    if prompt_id:
+        st.markdown(f"当前任务 ID：`{prompt_id}`")
+        if st.button("刷新结果"):
+            try:
+                history = comfyui_client.get_history(host, prompt_id)
+                outputs = comfyui_client.extract_outputs(history, prompt_id)
+                st.session_state["comfyui_outputs"] = outputs
+                if not outputs:
+                    st.info("暂未检测到输出，请稍后再试。")
+            except Exception as exc:
+                st.error(f"读取输出失败：{exc}")
+
+        outputs = st.session_state.get("comfyui_outputs", [])
+        st.markdown("### 输出预览")
+        if outputs:
+            for item in outputs:
+                url = comfyui_client.build_view_url(host, item)
+                if item.get("kind") == "video":
+                    st.video(url)
+                else:
+                    st.image(url)
+                st.caption(url)
+        else:
+            st.info("暂无输出，请先提交任务或点击刷新结果。")
 
 
 def load_sample() -> Dict[str, Any]:
@@ -151,6 +540,85 @@ def parse_json(text: str) -> Tuple[Dict[str, Any], str]:
         return {}, f"JSON 解析失败：{exc}"
 
 
+def parse_json_any(text: str) -> Tuple[Any, str]:
+    try:
+        data = json.loads(text) if text.strip() else None
+        return data, ""
+    except json.JSONDecodeError as exc:
+        return None, f"JSON 解析失败：{exc}"
+
+def build_friendly_prompt(mv_id: str) -> str:
+    return (
+        "你是殡葬纪念视频项目的内容整理助手。"
+        "请把给定的 JSON 输出转换成通俗易懂的陈述句，"
+        "适合普通用户甚至老人也能理解。"
+        "要求：用中文、分点陈述、句子简短、必须包含 JSON 里的关键字段和关键词（人名、地点、时间、情绪、事件等），"
+        "不要遗漏关键信息，也不要编造。"
+        f"输出标题包含 {mv_id}。"
+    )
+
+def build_json_rewrite_prompt(mv_id: str) -> str:
+    return (
+        "你是殡葬纪念视频项目的结构化输出整理助手。"
+        "用户会提供一段可读的中文描述，以及原始 JSON。"
+        "请将描述整理回与原始 JSON 结构一致的 JSON。"
+        "要求：保留原有字段结构；"
+        "描述中没有提到的字段尽量沿用原始值；"
+        "不要额外添加不存在的字段。"
+        f"输出必须是 {mv_id} 对应的 JSON。"
+    )
+
+
+def build_mv03_revision_prompt(mv03_skill: str) -> str:
+    return (
+        mv03_skill
+        + "\n\n附加要求：根据用户的意见与手工补充的分镜，"
+        "重新生成 MV03 的完整分镜 JSON，并输出通俗讲解。"
+        "输出必须是 JSON，包含两个字段：\n"
+        "1) storyboard_json：严格遵循 MV03 输出规范的 JSON；\n"
+        "2) friendly_summary：通俗易懂的陈述句，包含关键人物、时间、地点、情绪与事件。"
+        "如果用户手工提供了 scenes，请优先采用其结构与内容，除非与意见冲突。"
+    )
+
+
+def build_mv03_fill_prompt(mv03_skill: str) -> str:
+    return (
+        mv03_skill
+        + "\n\n你将收到当前分镜 JSON、已人工填写的字段，以及整体项目上下文。"
+        "请只补全/优化以下字段：shot_type, description, voice_script, mj_prompt, motion。"
+        "要求：保持场景语境一致、符合 MV03 模板，不要修改其他字段。"
+        "输出必须是 JSON，包含这五个字段。"
+    )
+
+
+def scenes_to_list(scenes: Any) -> List[Dict[str, Any]]:
+    if isinstance(scenes, list):
+        return [item for item in scenes if isinstance(item, dict)]
+    if isinstance(scenes, dict):
+        ordered_keys = sorted(scenes.keys())
+        return [scenes[key] for key in ordered_keys if isinstance(scenes[key], dict)]
+    return []
+
+
+def list_to_scene_dict(scenes: List[Dict[str, Any]]) -> Dict[str, Any]:
+    scene_dict: Dict[str, Any] = {}
+    for idx, scene in enumerate(scenes, start=1):
+        scene_id = scene.get("scene_id") if isinstance(scene, dict) else None
+        if not scene_id:
+            scene_id = f"scene_{idx:02d}"
+            if isinstance(scene, dict):
+                scene = {**scene, "scene_id": scene_id}
+        scene_dict[scene_id] = scene
+    return scene_dict
+
+
+def sync_mv03_editor_fields(scene: Dict[str, Any]) -> None:
+    st.session_state["mv03_edit_time"] = scene.get("time", "")
+    st.session_state["mv03_edit_shot_type"] = scene.get("shot_type", "")
+    st.session_state["mv03_edit_description"] = scene.get("description", "")
+    st.session_state["mv03_edit_voice"] = scene.get("voice_script", "")
+    st.session_state["mv03_edit_mj"] = scene.get("mj_prompt", "")
+    st.session_state["mv03_edit_motion"] = scene.get("motion", "")
 def render_sidebar() -> None:
     st.sidebar.markdown("## 流水线进度")
     for step in MV_STEPS:
@@ -177,39 +645,260 @@ def render_key_cards(output: Dict[str, Any], keys: List[str]) -> None:
 
 
 def render_mv03_scenes(output: Dict[str, Any]) -> None:
-    scenes = output.get("scenes", []) if isinstance(output, dict) else []
-    if isinstance(scenes, dict):
-        ordered_keys = sorted(scenes.keys())
-        scenes = [scenes[key] for key in ordered_keys]
+    scenes = scenes_to_list(output.get("scenes", []) if isinstance(output, dict) else [])
     if not isinstance(scenes, list) or not scenes:
         st.info("暂无分镜数据。")
         return
+
+    compact_mode = st.toggle("收起分镜详情（紧凑视图）", value=False, key="mv03_compact_view")
+
     for scene in scenes:
         if not isinstance(scene, dict):
             st.markdown(
-                "<div class='mv-card'><div class='mv-header'><strong>分镜内容</strong></div>",
+                "<div class='mv-card'><div class='mv-header'><strong>分镜摘要</strong></div>",
                 unsafe_allow_html=True,
             )
             st.write(scene)
+            if st.button("查看详情", key=f"detail_text_{hash(scene)}"):
+                st.session_state["mv03_detail_scene"] = {"description": str(scene)}
             st.markdown("</div>", unsafe_allow_html=True)
             continue
+
         scene_id = scene.get("scene_id") or scene.get("id") or scene.get("scene") or "unknown"
         timecode = scene.get("time") or scene.get("timecode") or "-"
-        narration = scene.get("voice_script") or scene.get("narration") or scene.get("voice_over") or "-"
+        shot_type = scene.get("shot_type", "-")
+        description = scene.get("description", "-")
+        if compact_mode:
+            st.markdown(
+                f"<div style='display:flex; align-items:center; gap:12px; padding:8px 4px;'>"
+                f"<span style='font-weight:600; color:#111;'>Scene {scene_id}</span>"
+                f"<span style='flex:1; height:1px; background:#e5e7eb;'></span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+            continue
+
         st.markdown(
-            f"<div class='mv-card'><div class='mv-header'><strong>分镜片段：Scene {scene_id}</strong></div>",
+            f"<div class='mv-card'><div class='mv-header'><strong>Scene {scene_id}</strong></div>",
             unsafe_allow_html=True,
         )
-        st.markdown(f"**⏱️ 时间码**：{timecode}&nbsp;&nbsp;&nbsp;&nbsp;**🎥 景别**：{scene.get('shot_type', '-')}")
-        st.markdown(f"**📝 画面描写**：<span style='color:#4b5563'>{scene.get('description', '-')}</span>", unsafe_allow_html=True)
-        st.markdown(f"**🎙️ 语音旁白**：<span style='color:#4b5563'>{narration}</span>", unsafe_allow_html=True)
-        st.markdown(f"**🔖 资产类型**：<span style='color:#6b7280; font-size:14px'>{scene.get('asset_type', '-')}</span>", unsafe_allow_html=True)
-        with st.expander("查看 mj_prompt", expanded=False):
-            st.write(scene.get("mj_prompt", "-"))
-        if st.button(f"↩️ 退回此镜 {scene_id}", key=f"reject_scene_{scene_id}"):
-            gate_manager.reject("MV03", {"ids": [scene_id]})
-            st.warning(f"已标记退回镜头：{scene_id}")
+        st.markdown(f"**⏱️ {timecode}** · **🎥 {shot_type}**")
+        st.markdown(f"<span style='color:#4b5563'>{description}</span>", unsafe_allow_html=True)
+        col_a, col_b, col_c = st.columns([1, 1, 2])
+        with col_a:
+            if st.button("查看详情", key=f"detail_{scene_id}"):
+                st.session_state["mv03_detail_scene"] = scene
+        with col_b:
+            if st.button(f"↩️ 退回此镜 {scene_id}", key=f"reject_scene_{scene_id}"):
+                gate_manager.reject("MV03", {"ids": [scene_id]})
+                st.warning(f"已标记退回镜头：{scene_id}")
+        with col_c:
+            detail_scene = st.session_state.get("mv03_detail_scene")
+            if detail_scene and detail_scene.get("scene_id") == scene_id:
+                st.markdown(
+                    "<div style='border:1px solid #e5e7eb; border-radius:12px; padding:12px;'>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown(f"**分镜详情 · Scene {scene_id}**")
+                st.markdown(f"**时间码**：{detail_scene.get('time', detail_scene.get('timecode', '-'))}")
+                st.markdown(f"**景别**：{detail_scene.get('shot_type', '-')}")
+                st.markdown(f"**画面描写**：{detail_scene.get('description', '-')}")
+                narration = detail_scene.get("voice_script") or detail_scene.get("narration") or detail_scene.get("voice_over")
+                if narration:
+                    st.markdown(f"**语音旁白**：{narration}")
+                st.markdown(f"**资产类型**：{detail_scene.get('asset_type', '-')}")
+                st.markdown("**MJ Prompt**")
+                st.code(detail_scene.get("mj_prompt", "-"), language="text")
+                if st.button("关闭详情", key=f"close_mv03_detail_{scene_id}"):
+                    st.session_state.pop("mv03_detail_scene", None)
+                    st.rerun()
+                st.markdown("</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
+
+
+    with st.expander("MV03 分镜调整（LLM + 手工编辑）", expanded=False):
+        feedback_key = "mv03_feedback"
+        manual_key = "mv03_manual_scenes"
+        if manual_key not in st.session_state:
+            st.session_state[manual_key] = json.dumps(scenes, ensure_ascii=False, indent=2)
+
+        st.markdown("### 分镜栏（可选中编辑）")
+        scene_ids = [item.get("scene_id", f"scene_{idx:02d}") for idx, item in enumerate(scenes, start=1)]
+        def _on_scene_change() -> None:
+            current_id = st.session_state.get("mv03_scene_selector")
+            current_scene = next((item for item in scenes if item.get("scene_id") == current_id), scenes[0])
+            sync_mv03_editor_fields(current_scene)
+
+        selected_scene_id = st.selectbox(
+            "选择分镜",
+            options=scene_ids,
+            key="mv03_scene_selector",
+            on_change=_on_scene_change,
+        )
+        selected_scene = next((item for item in scenes if item.get("scene_id") == selected_scene_id), scenes[0])
+
+        col_scene_left, col_scene_right = st.columns([3, 1])
+        with col_scene_left:
+            if "mv03_edit_time" not in st.session_state:
+                sync_mv03_editor_fields(selected_scene)
+            st.text_input("scene_id", value=selected_scene.get("scene_id", ""), key="mv03_edit_scene_id", disabled=True)
+            st.text_input("time", key="mv03_edit_time")
+            st.text_input("shot_type", key="mv03_edit_shot_type")
+            st.text_area("description", key="mv03_edit_description", height=80)
+            st.text_area("voice_script", key="mv03_edit_voice", height=90)
+            st.text_area("mj_prompt", key="mv03_edit_mj", height=90)
+            st.text_input("motion", key="mv03_edit_motion")
+
+        with col_scene_right:
+            if st.button("保存本镜", key="mv03_save_scene", use_container_width=True):
+                updated_scene = {
+                    **selected_scene,
+                    "shot_type": st.session_state.get("mv03_edit_shot_type", ""),
+                    "description": st.session_state.get("mv03_edit_description", ""),
+                    "voice_script": st.session_state.get("mv03_edit_voice", ""),
+                    "mj_prompt": st.session_state.get("mv03_edit_mj", ""),
+                    "motion": st.session_state.get("mv03_edit_motion", ""),
+                    "time": st.session_state.get("mv03_edit_time", ""),
+                }
+                new_scenes = []
+                for item in scenes:
+                    if item.get("scene_id") == selected_scene_id:
+                        new_scenes.append(updated_scene)
+                    else:
+                        new_scenes.append(item)
+                output["scenes"] = list_to_scene_dict(new_scenes)
+                output["total_scenes"] = len(new_scenes)
+                pipeline_runner.save_output("MV03", output)
+                st.success("已保存分镜修改")
+                st.rerun()
+
+            if st.button("一键补全字段", key="mv03_fill_scene", use_container_width=True):
+                with st.spinner("正在调用 LLM 补全分镜字段..."):
+                    mv03_prompt = pipeline_runner.get_skill_prompt("MV03")
+                    system_prompt = build_mv03_fill_prompt(mv03_prompt)
+                    payload = {
+                        "project_json": output,
+                        "current_scene": selected_scene,
+                        "edited_fields": {
+                            "shot_type": st.session_state.get("mv03_edit_shot_type", ""),
+                            "description": st.session_state.get("mv03_edit_description", ""),
+                            "voice_script": st.session_state.get("mv03_edit_voice", ""),
+                            "mj_prompt": st.session_state.get("mv03_edit_mj", ""),
+                            "motion": st.session_state.get("mv03_edit_motion", ""),
+                        },
+                    }
+                    result = call_structured(system_prompt, json.dumps(payload, ensure_ascii=False, indent=2))
+                    if result.get("error"):
+                        st.error(result.get("message", "补全失败"))
+                    else:
+                        st.session_state["mv03_edit_shot_type"] = result.get("shot_type", "")
+                        st.session_state["mv03_edit_description"] = result.get("description", "")
+                        st.session_state["mv03_edit_voice"] = result.get("voice_script", "")
+                        st.session_state["mv03_edit_mj"] = result.get("mj_prompt", "")
+                        st.session_state["mv03_edit_motion"] = result.get("motion", "")
+                        st.success("已补全字段，请检查后保存")
+
+            if st.button("新增分镜", key="mv03_add_scene", use_container_width=True):
+                new_id = f"scene_{len(scenes) + 1:02d}"
+                new_scene = {
+                    "scene_id": new_id,
+                    "time": "",
+                    "shot_type": "",
+                    "description": "",
+                    "voice_script": "",
+                    "asset_type": selected_scene.get("asset_type", "ai_generated_video"),
+                    "mj_prompt": "",
+                    "negative_prompt": selected_scene.get("negative_prompt"),
+                    "motion": "",
+                    "fallback_asset": selected_scene.get("fallback_asset"),
+                }
+                new_scenes = scenes + [new_scene]
+                output["scenes"] = list_to_scene_dict(new_scenes)
+                output["total_scenes"] = len(new_scenes)
+                pipeline_runner.save_output("MV03", output)
+                st.success(f"已新增 {new_id}")
+                st.rerun()
+
+            if st.button("删除本镜", key="mv03_delete_scene", use_container_width=True):
+                remaining = [item for item in scenes if item.get("scene_id") != selected_scene_id]
+                output["scenes"] = list_to_scene_dict(remaining)
+                output["total_scenes"] = len(remaining)
+                pipeline_runner.save_output("MV03", output)
+                st.success(f"已删除 {selected_scene_id}")
+                st.rerun()
+
+        st.text_area(
+            "对分镜的意见（越具体越好）",
+            key=feedback_key,
+            height=120,
+            placeholder="例如：删掉太悲伤的镜头、增加孙女回忆的镜头、把第2镜时长缩短...",
+        )
+
+        st.text_area(
+            "手工分镜 JSON（可删除/新增/改写）",
+            key=manual_key,
+            height=240,
+            help="支持 list 或 dict 格式，字段需遵循 MV03 模板。",
+        )
+
+        col_a, col_b, col_c = st.columns([1, 1, 1])
+        with col_a:
+            delete_id = st.text_input("要删除的 scene_id", key="mv03_delete_id")
+            if st.button("删除该分镜", key="mv03_delete_btn", use_container_width=True):
+                if delete_id:
+                    remaining = [item for item in scenes if item.get("scene_id") != delete_id]
+                    output["scenes"] = list_to_scene_dict(remaining)
+                    output["total_scenes"] = len(remaining)
+                    pipeline_runner.save_output("MV03", output)
+                    st.success(f"已删除 {delete_id}")
+                    st.rerun()
+                else:
+                    st.warning("请输入要删除的 scene_id")
+
+        with col_b:
+            if st.button("应用手工分镜", key="mv03_apply_manual", use_container_width=True):
+                manual_text = st.session_state.get(manual_key, "")
+                parsed, err = parse_json_any(manual_text)
+                if err:
+                    st.error(err)
+                else:
+                    if isinstance(parsed, list):
+                        scene_list = [item for item in parsed if isinstance(item, dict)]
+                        output["scenes"] = list_to_scene_dict(scene_list)
+                        output["total_scenes"] = len(scene_list)
+                    elif isinstance(parsed, dict):
+                        output["scenes"] = parsed
+                        output["total_scenes"] = len(parsed)
+                    else:
+                        st.error("手工分镜必须是 list 或 dict")
+                        return
+                    pipeline_runner.save_output("MV03", output)
+                    st.success("已应用手工分镜")
+                    st.rerun()
+
+        with col_c:
+            if st.button("按意见重写分镜", key="mv03_llm_rewrite", use_container_width=True):
+                if not output:
+                    st.warning("暂无 JSON 输出，无法重写。")
+                else:
+                    with st.spinner("正在调用 LLM 生成新分镜..."):
+                        mv03_prompt = pipeline_runner.get_skill_prompt("MV03")
+                        system_prompt = build_mv03_revision_prompt(mv03_prompt)
+                        payload = {
+                            "original_json": output,
+                            "user_feedback": st.session_state.get(feedback_key, ""),
+                            "manual_scenes": st.session_state.get(manual_key, ""),
+                        }
+                        result = call_structured(system_prompt, json.dumps(payload, ensure_ascii=False, indent=2))
+                        storyboard = result.get("storyboard_json") if isinstance(result, dict) else None
+                        summary = result.get("friendly_summary", "") if isinstance(result, dict) else ""
+                        if not isinstance(storyboard, dict):
+                            st.error("LLM 返回结果不包含 storyboard_json")
+                            return
+                        pipeline_runner.save_output("MV03", storyboard)
+                        st.session_state["friendly_MV03"] = summary
+                        st.success("已生成新的分镜 JSON，并同步通俗讲解")
+                        st.rerun()
 
 
 def render_mv04_bibles(output: Dict[str, Any], approved: bool) -> None:
@@ -257,12 +946,76 @@ def render_step(step: Dict[str, str], mv01_input: Dict[str, Any], input_ok: bool
         st.error(state.get("error"))
 
     if mv_id == "MV03":
+        with st.expander("MV03 独立输入（跳过 MV01/MV02）", expanded=False):
+            mv03_default = json.dumps(MV03_STANDALONE_SAMPLE, ensure_ascii=False, indent=2)
+            mv03_text = st.text_area(
+                "MV03 输入 JSON",
+                value=mv03_default,
+                height=240,
+                key="mv03_standalone_input",
+            )
+            mv03_payload, mv03_err = parse_json(mv03_text)
+            if mv03_err:
+                st.warning(mv03_err)
+            if st.button("仅用输入生成 MV03 分镜", key="mv03_standalone_run", use_container_width=True):
+                if mv03_err:
+                    st.warning("请输入有效的 JSON 后再提交。")
+                else:
+                    with st.spinner("正在生成 MV03 分镜..."):
+                        pipeline_runner.run_mv03_from_payload(mv03_payload)
+                    st.success("已生成 MV03 分镜")
+                    st.rerun()
         render_mv03_scenes(output)
     elif mv_id == "MV04":
         render_mv04_bibles(output, status == "approved")
     else:
         with st.expander("查看 JSON 输出", expanded=True):
             st.json(output or {})
+
+    with st.expander("通俗描述（可编辑）", expanded=False):
+        friendly_key = f"friendly_{mv_id}"
+        if friendly_key not in st.session_state:
+            st.session_state[friendly_key] = ""
+
+        col_left, col_right = st.columns([1, 1])
+        with col_left:
+            if st.button("生成通俗描述", key=f"gen_friendly_{mv_id}", use_container_width=True):
+                if not output:
+                    st.warning("暂无 JSON 输出，无法生成描述。")
+                else:
+                    with st.spinner("正在生成通俗描述..."):
+                        prompt = build_friendly_prompt(mv_id)
+                        source_text = json.dumps(output, ensure_ascii=False, indent=2)
+                        st.session_state[friendly_key] = call_freeform(prompt, source_text)
+        with col_right:
+            if st.button("用通俗描述回写 JSON", key=f"rewrite_json_{mv_id}", use_container_width=True):
+                if not output:
+                    st.warning("暂无 JSON 输出，无法回写。")
+                else:
+                    with st.spinner("正在整理 JSON..."):
+                        prompt = build_json_rewrite_prompt(mv_id)
+                        payload = json.dumps(
+                            {
+                                "original_json": output,
+                                "edited_text": st.session_state.get(friendly_key, ""),
+                            },
+                            ensure_ascii=False,
+                            indent=2,
+                        )
+                        result = call_structured(prompt, payload)
+                        if result.get("error"):
+                            st.error(result.get("message", "回写失败"))
+                        else:
+                            pipeline_runner.save_output(mv_id, result)
+                            st.success("已更新 JSON 输出。")
+                            st.rerun()
+
+        st.text_area(
+            "通俗描述内容",
+            key=friendly_key,
+            height=200,
+            placeholder="点击上方按钮生成通俗描述，然后可以直接编辑...",
+        )
 
     if mv_id == "MV05" and output.get("requires_unlock_and_relock") is True:
         st.error("⚠️ 需返回MV04补齐三要素再重跑")
@@ -293,7 +1046,7 @@ def render_step(step: Dict[str, str], mv01_input: Dict[str, Any], input_ok: bool
             placeholder="scene_01, field_name",
             label_visibility="collapsed",
         )
-    if st.button("⬅ 退回", key=f"reject_{mv_id}", use_container_width=True):
+        if st.button("⬅ 退回", key=f"reject_{mv_id}", use_container_width=True):
             scope_ids = [item.strip() for item in scope_text.split(",") if item.strip()]
             scope = {"ids": scope_ids} if scope_ids else {"reason": "manual_reject"}
             gate_manager.reject(mv_id, scope)
@@ -326,21 +1079,27 @@ def render_step(step: Dict[str, str], mv01_input: Dict[str, Any], input_ok: bool
 sample_inputs = load_sample()
 render_sidebar()
 
-st.title("追悼会 MV 执行层 Demo")
+tab_pipeline, tab_comfy = st.tabs(["MV 流水线", "ComfyUI 生成中心"])
 
-input_default = json.dumps(sample_inputs, ensure_ascii=False, indent=2)
-mv01_text = st.text_area("MV01 输入 JSON", value=input_default, height=240)
-mv01_input, mv01_error = parse_json(mv01_text)
-if mv01_error:
-    st.warning(mv01_error)
+with tab_pipeline:
+    st.title("追悼会 MV 执行层 Demo")
 
-if st.button("▶ 从 MV01 开始执行", type="primary"):
-    pipeline_runner.run_step("MV01", mv01_input)
-    st.rerun()
+    input_default = json.dumps(sample_inputs, ensure_ascii=False, indent=2)
+    mv01_text = st.text_area("MV01 输入 JSON", value=input_default, height=240)
+    mv01_input, mv01_error = parse_json(mv01_text)
+    if mv01_error:
+        st.warning(mv01_error)
 
-st.divider()
+    if st.button("▶ 从 MV01 开始执行", type="primary"):
+        pipeline_runner.run_step("MV01", mv01_input)
+        st.rerun()
 
-for step in MV_STEPS:
-    if step["id"] != "MV01" and not gate_manager.can_run(step["id"]):
-        st.info(f"{step['id']} 需等待上一环节审核通过。")
-    render_step(step, mv01_input, not bool(mv01_error))
+    st.divider()
+
+    for step in MV_STEPS:
+        if step["id"] != "MV01" and not gate_manager.can_run(step["id"]):
+            st.info(f"{step['id']} 需等待上一环节审核通过。")
+        render_step(step, mv01_input, not bool(mv01_error))
+
+with tab_comfy:
+    render_comfyui_panel()
