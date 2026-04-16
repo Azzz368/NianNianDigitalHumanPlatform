@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import time
@@ -9,6 +10,8 @@ from openai import OpenAI
 load_dotenv()
 
 PRIMARY_MODEL = os.getenv("OPENAI_MODEL", "qwen3.5:9b")
+VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", PRIMARY_MODEL)
+AUDIO_MODEL = os.getenv("OPENAI_AUDIO_MODEL", "whisper-1")
 FALLBACK_MODELS = [
     item.strip()
     for item in os.getenv("OPENAI_FALLBACK_MODELS", "").split(",")
@@ -111,3 +114,53 @@ def call_structured(system_prompt: str, user_content: str) -> Dict[str, Any]:
                     time.sleep(2)
 
     return {"error": True, "message": last_error or "Unknown error"}
+
+
+def describe_image(image_bytes: bytes, filename: str) -> str:
+    last_error: Optional[str] = None
+    encoded = base64.b64encode(image_bytes).decode("utf-8")
+    image_url = f"data:image/{filename.split('.')[-1].lower()};base64,{encoded}"
+    system_prompt = (
+        "你是图像理解助手，请输出简洁的中文描述，并尽量提取图片里的文字信息。"
+        "如果有清晰文字，请在描述里包含。"
+    )
+    for model_name, client in _iter_model_clients():
+        for attempt in range(1, 3):
+            try:
+                response = client.chat.completions.create(
+                    model=VISION_MODEL or model_name,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "请描述这张图片"},
+                                {"type": "image_url", "image_url": {"url": image_url}},
+                            ],
+                        },
+                    ],
+                    temperature=0.2,
+                )
+                return response.choices[0].message.content or ""
+            except Exception as exc:  # pragma: no cover
+                last_error = f"{model_name}: {exc}"
+                if attempt < 2:
+                    time.sleep(1)
+    return f"[IMAGE_PARSE_ERROR] {last_error or 'Unknown error'}"
+
+
+def transcribe_audio(audio_bytes: bytes, filename: str) -> str:
+    last_error: Optional[str] = None
+    for model_name, client in _iter_model_clients():
+        for attempt in range(1, 3):
+            try:
+                response = client.audio.transcriptions.create(
+                    model=AUDIO_MODEL or model_name,
+                    file=(filename, audio_bytes),
+                )
+                return getattr(response, "text", "") or ""
+            except Exception as exc:  # pragma: no cover
+                last_error = f"{model_name}: {exc}"
+                if attempt < 2:
+                    time.sleep(1)
+    return f"[AUDIO_PARSE_ERROR] {last_error or 'Unknown error'}"

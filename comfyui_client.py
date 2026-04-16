@@ -28,6 +28,15 @@ def upload_image(
     return payload.get("name") or payload.get("filename") or filename
 
 
+def ping(host: str) -> bool:
+    try:
+        url = f"{_base_url(host)}/queue"
+        response = requests.get(url, timeout=3)
+        return response.ok
+    except Exception:
+        return False
+
+
 def submit_prompt(host: str, workflow: Dict[str, Any]) -> str:
     url = f"{_base_url(host)}/prompt"
     response = requests.post(url, json={"prompt": workflow}, timeout=60)

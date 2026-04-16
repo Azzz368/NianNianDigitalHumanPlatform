@@ -1,4 +1,7 @@
 import json
+import time
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 import copy
@@ -10,13 +13,13 @@ from streamlit_cropper import st_cropper
 import gate_manager
 import pipeline_runner
 import comfyui_client
-from llm_client import call_freeform, call_structured
+from llm_client import call_freeform, call_structured, describe_image, transcribe_audio
 
 MV_STEPS = [
     {"id": "MV01", "name": "MV01 家属访谈结构化"},
     {"id": "MV02", "name": "MV02 信息校验与补全"},
-    {"id": "MV03", "name": "MV03 分镜脚本生成"},
-    {"id": "MV04", "name": "MV04 三要素定稿"},
+    {"id": "MV03", "name": "MV03 三要素定稿"},
+    {"id": "MV04", "name": "MV04 分镜制作"},
     {"id": "MV05", "name": "MV05 数字人渲染编排"},
     {"id": "MV06", "name": "MV06 最终时间轴"},
 ]
@@ -239,7 +242,12 @@ COMFYUI_WORKFLOWS = {
     },
 }
 
-MV03_STANDALONE_SAMPLE = {
+COMFYUI_CANDIDATE_HOSTS = [
+    "http://10.79.91.37:8188/",
+    "http://10.79.65.44:8188/",
+]
+
+MV04_STANDALONE_SAMPLE = {
     "family_memory_text": "爷爷叫张建国，1948年5月12日出生在山东，2023年10月25日去世，享年75岁。追悼会定于10月29日在XX殡仪馆告别厅举行。爷爷最让我们记住的事，是他退休后每天早上5点起床为全家煮小米粥，坚持了40年。还有一件事是他退休后自学木工，亲手为孙女打了一套儿童家具。爷爷参过军，1970年入伍，服役10年。1985年还被评为单位先进工作者。遗愿是希望家人身体健康，孙女能考上好大学。主要致辞人是女儿张敏，偏好温和真诚的风格。",
     "uploaded_assets": [
         {
@@ -390,13 +398,69 @@ def apply_workflow_inputs(workflow: Dict[str, Any], config: Dict[str, Any], valu
     return updated
 
 
+def build_comfyui_image_payload(
+    prompt_text: str,
+    workflow_name: str = "Flux2 文生图 9B",
+    seed: int | None = None,
+) -> Dict[str, Any]:
+    workflow_config = COMFYUI_WORKFLOWS.get(workflow_name)
+    if not workflow_config:
+        raise ValueError("未找到 ComfyUI 文生图工作流")
+    workflow = load_comfyui_workflow(workflow_config["file"])
+    defaults = get_workflow_defaults(workflow, workflow_config)
+    payload_values = {
+        "prompt": prompt_text,
+        "negative": defaults.get("negative", ""),
+        "width": defaults.get("width", 1280),
+        "height": defaults.get("height", 720),
+        "steps": defaults.get("steps", 20),
+        "cfg": defaults.get("cfg", 5),
+        "sampler": defaults.get("sampler", "euler"),
+        "seed": seed if seed is not None else defaults.get("seed", 42),
+        "lora_strength": defaults.get("lora_strength"),
+    }
+    return apply_workflow_inputs(workflow, workflow_config, payload_values)
+
+
+def build_comfyui_i2v_payload(prompt_text: str, source_image: str) -> Dict[str, Any]:
+    workflow_config = COMFYUI_WORKFLOWS.get("LTX 2.3 视频 I2V")
+    if not workflow_config:
+        raise ValueError("未找到 ComfyUI 图生视频工作流")
+    workflow = load_comfyui_workflow(workflow_config["file"])
+    defaults = get_workflow_defaults(workflow, workflow_config)
+    payload_values = {
+        "prompt": prompt_text,
+        "negative": defaults.get("negative", ""),
+        "width": defaults.get("width", 1280),
+        "height": defaults.get("height", 720),
+        "cfg": defaults.get("cfg", 5),
+        "sampler": defaults.get("sampler", "euler"),
+        "seed": defaults.get("seed", 42),
+        "lora_strength": defaults.get("lora_strength"),
+        "source_image": source_image,
+    }
+    return apply_workflow_inputs(workflow, workflow_config, payload_values)
+
+
+def resolve_comfyui_host(custom_host: str | None = None) -> str:
+    candidates = [custom_host] if custom_host else []
+    candidates.extend(COMFYUI_CANDIDATE_HOSTS)
+    for candidate in candidates:
+        if not candidate:
+            continue
+        if comfyui_client.ping(candidate):
+            return candidate
+    return custom_host or COMFYUI_CANDIDATE_HOSTS[0]
+
+
 def render_comfyui_panel() -> None:
     st.markdown("## ComfyUI 生成中心")
     st.caption("连接同一 WiFi 的 5090 主机 ComfyUI，直接调用已准备的工作流。")
 
+    detected_host = resolve_comfyui_host(st.session_state.get("comfyui_host"))
     host = st.text_input(
         "ComfyUI 节点地址",
-        value=st.session_state.get("comfyui_host", "http://10.79.65.44:8188/"),
+        value=detected_host,
         help="支持输入 IP 或完整 URL，默认端口 8188。",
     )
     st.session_state["comfyui_host"] = host
@@ -573,7 +637,7 @@ def build_mv03_revision_prompt(mv03_skill: str) -> str:
     return (
         mv03_skill
         + "\n\n附加要求：根据用户的意见与手工补充的分镜，"
-        "重新生成 MV03 的完整分镜 JSON，并输出通俗讲解。"
+        "重新生成 MV04 的完整分镜 JSON，并输出通俗讲解。"
         "输出必须是 JSON，包含两个字段：\n"
         "1) storyboard_json：严格遵循 MV03 输出规范的 JSON；\n"
         "2) friendly_summary：通俗易懂的陈述句，包含关键人物、时间、地点、情绪与事件。"
@@ -589,6 +653,48 @@ def build_mv03_fill_prompt(mv03_skill: str) -> str:
         "要求：保持场景语境一致、符合 MV03 模板，不要修改其他字段。"
         "输出必须是 JSON，包含这五个字段。"
     )
+
+
+def build_intake_prompt() -> str:
+    return (
+        "你是追悼会/生命回顾视频项目的信息整理助手。"
+        "请根据用户输入的文字信息、素材清单与解析备注，整理出 MV01 所需的结构化 JSON。"
+        "必须输出 JSON，字段包含："
+        "family_memory_text, uploaded_assets, style_preference, emotional_intensity, ceremony_type, "
+        "ceremony_date, total_duration_sec, relatives, last_wishes。"
+        "uploaded_assets 为数组，每项包含 asset_id, type, description, time_period 或 duration_sec。"
+        "如果素材信息不足，请根据文件名和用户描述进行合理概括，不要编造细节。"
+        "请自动识别 relatives、style_preference、emotional_intensity 等字段，并与用户语气保持一致。"
+        "relatives 是数组，字段包含 relation, name, is_main_speaker, speech_preference。"
+    )
+
+
+def extract_audio_from_video(video_bytes: bytes, suffix: str) -> Tuple[bytes | None, str]:
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_path = Path(tmpdir) / f"input{suffix}"
+            audio_path = Path(tmpdir) / "audio.wav"
+            video_path.write_bytes(video_bytes)
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(video_path),
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                str(audio_path),
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if result.returncode != 0 or not audio_path.exists():
+                return None, result.stderr.strip() or "ffmpeg 解析失败"
+            return audio_path.read_bytes(), ""
+    except FileNotFoundError:
+        return None, "未检测到 ffmpeg，无法解析视频"
+    except Exception as exc:  # pragma: no cover
+        return None, str(exc)
 
 
 def scenes_to_list(scenes: Any) -> List[Dict[str, Any]]:
@@ -686,8 +792,16 @@ def render_mv03_scenes(output: Dict[str, Any]) -> None:
         st.markdown(f"<span style='color:#4b5563'>{description}</span>", unsafe_allow_html=True)
         col_a, col_b, col_c = st.columns([1, 1, 2])
         with col_a:
-            if st.button("查看详情", key=f"detail_{scene_id}"):
-                st.session_state["mv03_detail_scene"] = scene
+            is_open = (
+                st.session_state.get("mv03_detail_scene", {}).get("scene_id") == scene_id
+            )
+            detail_label = "关闭详情" if is_open else "查看详情"
+            if st.button(detail_label, key=f"detail_{scene_id}"):
+                if is_open:
+                    st.session_state.pop("mv03_detail_scene", None)
+                else:
+                    st.session_state["mv03_detail_scene"] = scene
+                st.rerun()
         with col_b:
             if st.button(f"↩️ 退回此镜 {scene_id}", key=f"reject_scene_{scene_id}"):
                 gate_manager.reject("MV03", {"ids": [scene_id]})
@@ -701,6 +815,8 @@ def render_mv03_scenes(output: Dict[str, Any]) -> None:
                 )
                 st.markdown(f"**分镜详情 · Scene {scene_id}**")
                 st.markdown(f"**时间码**：{detail_scene.get('time', detail_scene.get('timecode', '-'))}")
+                if detail_scene.get("duration_bucket"):
+                    st.markdown(f"**时长规格**：{detail_scene.get('duration_bucket')}")
                 st.markdown(f"**景别**：{detail_scene.get('shot_type', '-')}")
                 st.markdown(f"**画面描写**：{detail_scene.get('description', '-')}")
                 narration = detail_scene.get("voice_script") or detail_scene.get("narration") or detail_scene.get("voice_over")
@@ -709,14 +825,132 @@ def render_mv03_scenes(output: Dict[str, Any]) -> None:
                 st.markdown(f"**资产类型**：{detail_scene.get('asset_type', '-')}")
                 st.markdown("**MJ Prompt**")
                 st.code(detail_scene.get("mj_prompt", "-"), language="text")
-                if st.button("关闭详情", key=f"close_mv03_detail_{scene_id}"):
-                    st.session_state.pop("mv03_detail_scene", None)
-                    st.rerun()
+                st.markdown("**全局 Prompt**")
+                st.code(detail_scene.get("prompt_global", "-"), language="text")
+                st.markdown("**首帧 Prompt**")
+                st.code(detail_scene.get("prompt_start", "-"), language="text")
+                st.markdown("**视频 Prompt**")
+                st.code(detail_scene.get("prompt_video", "-"), language="text")
+
+                st.divider()
+                st.markdown("**ComfyUI 渲染**")
+                comfy_host = resolve_comfyui_host(st.session_state.get("comfyui_host"))
+                prompt_text = detail_scene.get("mj_prompt") or detail_scene.get("description") or ""
+                if "mv03_comfy_outputs" not in st.session_state:
+                    st.session_state["mv03_comfy_outputs"] = {}
+                if "mv03_comfy_prompt_ids" not in st.session_state:
+                    st.session_state["mv03_comfy_prompt_ids"] = {}
+                if "mv03_comfy_video_prompt_ids" not in st.session_state:
+                    st.session_state["mv03_comfy_video_prompt_ids"] = {}
+                if "mv03_comfy_video_outputs" not in st.session_state:
+                    st.session_state["mv03_comfy_video_outputs"] = {}
+                if "mv03_comfy_last_poll" not in st.session_state:
+                    st.session_state["mv03_comfy_last_poll"] = {}
+                if "mv03_comfy_video_last_poll" not in st.session_state:
+                    st.session_state["mv03_comfy_video_last_poll"] = {}
+
+                col_render_a, _ = st.columns([1, 1])
+                with col_render_a:
+                    if st.button("提交渲染任务", key=f"mv03_comfy_submit_{scene_id}"):
+                        if not prompt_text:
+                            st.warning("当前分镜没有可用的 Prompt。")
+                        else:
+                            try:
+                                workflow_payload = build_comfyui_image_payload(
+                                    prompt_text,
+                                    seed=int(time.time() * 1000) % 2_147_483_647,
+                                )
+                                prompt_id = comfyui_client.submit_prompt(comfy_host, workflow_payload)
+                                st.session_state["mv03_comfy_prompt_ids"][scene_id] = prompt_id
+                                st.session_state["mv03_comfy_last_poll"][scene_id] = 0.0
+                                st.success("已提交渲染任务")
+                            except Exception as exc:
+                                st.error(f"提交失败：{exc}")
+
+                prompt_id = st.session_state["mv03_comfy_prompt_ids"].get(scene_id)
+                if prompt_id:
+                    last_poll = st.session_state["mv03_comfy_last_poll"].get(scene_id, 0.0)
+                    now = time.time()
+                    if now - last_poll > 5:
+                        try:
+                            history = comfyui_client.get_history(comfy_host, prompt_id)
+                            outputs = comfyui_client.extract_outputs(history, prompt_id)
+                            st.session_state["mv03_comfy_outputs"][scene_id] = outputs
+                            st.session_state["mv03_comfy_last_poll"][scene_id] = now
+                        except Exception as exc:
+                            st.error(f"读取输出失败：{exc}")
+
+                video_prompt_id = st.session_state["mv03_comfy_video_prompt_ids"].get(scene_id)
+                if video_prompt_id:
+                    last_poll = st.session_state["mv03_comfy_video_last_poll"].get(scene_id, 0.0)
+                    now = time.time()
+                    if now - last_poll > 5:
+                        try:
+                            history = comfyui_client.get_history(comfy_host, video_prompt_id)
+                            outputs = comfyui_client.extract_outputs(history, video_prompt_id)
+                            st.session_state["mv03_comfy_video_outputs"][scene_id] = outputs
+                            st.session_state["mv03_comfy_video_last_poll"][scene_id] = now
+                        except Exception as exc:
+                            st.error(f"读取视频输出失败：{exc}")
+
+                outputs = st.session_state["mv03_comfy_outputs"].get(scene_id, [])
+                if outputs:
+                    st.markdown("**渲染队列预览**")
+                    thumb_cols = st.columns(5)
+                    for idx, item in enumerate(outputs):
+                        url = comfyui_client.build_view_url(comfy_host, item)
+                        with thumb_cols[idx % 5]:
+                            st.image(url, width=120)
+                            zoom_key = f"mv03_comfy_zoom_url_{scene_id}"
+                            zoom_label = "收起" if st.session_state.get(zoom_key) == url else "放大"
+                            if st.button(zoom_label, key=f"mv03_comfy_zoom_{scene_id}_{idx}"):
+                                if st.session_state.get(zoom_key) == url:
+                                    st.session_state.pop(zoom_key, None)
+                                else:
+                                    st.session_state[zoom_key] = url
+
+                    zoom_url = st.session_state.get(f"mv03_comfy_zoom_url_{scene_id}")
+                    if zoom_url:
+                        st.markdown("**大图预览**")
+                        st.image(zoom_url, width="stretch")
+
+                image_outputs = [item for item in outputs if item.get("kind") == "image"]
+                if image_outputs:
+                    st.markdown("**图生视频**")
+                    image_options = {
+                        f"{item.get('filename')}": item for item in image_outputs
+                    }
+                    selected_image_name = st.selectbox(
+                        "选择首帧图像",
+                        options=list(image_options.keys()),
+                        key=f"mv03_i2v_select_{scene_id}",
+                    )
+                    if st.button("生成视频", key=f"mv03_i2v_run_{scene_id}"):
+                        try:
+                            prompt_for_video = detail_scene.get("prompt_video") or prompt_text
+                            workflow_payload = build_comfyui_i2v_payload(
+                                prompt_for_video,
+                                selected_image_name,
+                            )
+                            prompt_id = comfyui_client.submit_prompt(comfy_host, workflow_payload)
+                            st.session_state["mv03_comfy_video_prompt_ids"][scene_id] = prompt_id
+                            st.session_state["mv03_comfy_video_last_poll"][scene_id] = 0.0
+                            st.success("已提交视频任务")
+                        except Exception as exc:
+                            st.error(f"视频任务提交失败：{exc}")
+
+                video_outputs = st.session_state["mv03_comfy_video_outputs"].get(scene_id, [])
+                if video_outputs:
+                    st.markdown("**视频预览**")
+                    for item in video_outputs:
+                        if item.get("kind") == "video":
+                            url = comfyui_client.build_view_url(comfy_host, item)
+                            st.video(url)
                 st.markdown("</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
 
-    with st.expander("MV03 分镜调整（LLM + 手工编辑）", expanded=False):
+    with st.expander("MV04 分镜调整（LLM + 手工编辑）", expanded=False):
         feedback_key = "mv03_feedback"
         manual_key = "mv03_manual_scenes"
         if manual_key not in st.session_state:
@@ -774,7 +1008,7 @@ def render_mv03_scenes(output: Dict[str, Any]) -> None:
 
             if st.button("一键补全字段", key="mv03_fill_scene", use_container_width=True):
                 with st.spinner("正在调用 LLM 补全分镜字段..."):
-                    mv03_prompt = pipeline_runner.get_skill_prompt("MV03")
+                    mv03_prompt = pipeline_runner.get_skill_prompt("MV04")
                     system_prompt = build_mv03_fill_prompt(mv03_prompt)
                     payload = {
                         "project_json": output,
@@ -882,7 +1116,7 @@ def render_mv03_scenes(output: Dict[str, Any]) -> None:
                     st.warning("暂无 JSON 输出，无法重写。")
                 else:
                     with st.spinner("正在调用 LLM 生成新分镜..."):
-                        mv03_prompt = pipeline_runner.get_skill_prompt("MV03")
+                        mv03_prompt = pipeline_runner.get_skill_prompt("MV04")
                         system_prompt = build_mv03_revision_prompt(mv03_prompt)
                         payload = {
                             "original_json": output,
@@ -895,8 +1129,8 @@ def render_mv03_scenes(output: Dict[str, Any]) -> None:
                         if not isinstance(storyboard, dict):
                             st.error("LLM 返回结果不包含 storyboard_json")
                             return
-                        pipeline_runner.save_output("MV03", storyboard)
-                        st.session_state["friendly_MV03"] = summary
+                        pipeline_runner.save_output("MV04", storyboard)
+                        st.session_state["friendly_MV04"] = summary
                         st.success("已生成新的分镜 JSON，并同步通俗讲解")
                         st.rerun()
 
@@ -947,7 +1181,7 @@ def render_step(step: Dict[str, str], mv01_input: Dict[str, Any], input_ok: bool
 
     if mv_id == "MV03":
         with st.expander("MV03 独立输入（跳过 MV01/MV02）", expanded=False):
-            mv03_default = json.dumps(MV03_STANDALONE_SAMPLE, ensure_ascii=False, indent=2)
+            mv03_default = json.dumps(sample_inputs, ensure_ascii=False, indent=2)
             mv03_text = st.text_area(
                 "MV03 输入 JSON",
                 value=mv03_default,
@@ -957,17 +1191,17 @@ def render_step(step: Dict[str, str], mv01_input: Dict[str, Any], input_ok: bool
             mv03_payload, mv03_err = parse_json(mv03_text)
             if mv03_err:
                 st.warning(mv03_err)
-            if st.button("仅用输入生成 MV03 分镜", key="mv03_standalone_run", use_container_width=True):
+            if st.button("仅用输入生成 MV03 三要素", key="mv03_standalone_run", use_container_width=True):
                 if mv03_err:
                     st.warning("请输入有效的 JSON 后再提交。")
                 else:
-                    with st.spinner("正在生成 MV03 分镜..."):
+                    with st.spinner("正在生成 MV03 三要素..."):
                         pipeline_runner.run_mv03_from_payload(mv03_payload)
-                    st.success("已生成 MV03 分镜")
+                    st.success("已生成 MV03 三要素")
                     st.rerun()
-        render_mv03_scenes(output)
-    elif mv_id == "MV04":
         render_mv04_bibles(output, status == "approved")
+    elif mv_id == "MV04":
+        render_mv03_scenes(output)
     else:
         with st.expander("查看 JSON 输出", expanded=True):
             st.json(output or {})
@@ -1018,7 +1252,7 @@ def render_step(step: Dict[str, str], mv01_input: Dict[str, Any], input_ok: bool
         )
 
     if mv_id == "MV05" and output.get("requires_unlock_and_relock") is True:
-        st.error("⚠️ 需返回MV04补齐三要素再重跑")
+        st.error("⚠️ 需返回MV03补齐三要素再重跑")
 
     if mv_id == "MV02" and output.get("status") == "needs_input":
         prompts = output.get("prompts", [])
@@ -1057,7 +1291,7 @@ def render_step(step: Dict[str, str], mv01_input: Dict[str, Any], input_ok: bool
     with col3:
         approve_disabled = status != "awaiting_review" or (mv_id == "MV02" and output.get("status") == "needs_input")
         approve_label = "✅ 通过 →"
-        if mv_id == "MV04":
+        if mv_id == "MV03":
             approve_label = "✅ 确认三要素"
         if mv_id == "MV06":
             approve_label = "✅ 终审通过，导出最终JSON"
@@ -1084,8 +1318,88 @@ tab_pipeline, tab_comfy = st.tabs(["MV 流水线", "ComfyUI 生成中心"])
 with tab_pipeline:
     st.title("追悼会 MV 执行层 Demo")
 
+    with st.expander("🧾 信息采集（文本 + 图片/音频/视频上传）", expanded=False):
+        st.caption("支持粘贴文字与上传素材，系统会自动整理成 MV01 输入 JSON。")
+        intake_text = st.text_area(
+            "输入文字信息",
+            height=180,
+            key="intake_text",
+            placeholder="可粘贴生平/回忆/仪式信息...",
+        )
+        intake_files = st.file_uploader(
+            "上传素材（图片/音频/视频，可多选）",
+            type=["png", "jpg", "jpeg", "webp", "mp3", "wav", "m4a", "mp4", "mov", "mkv"],
+            accept_multiple_files=True,
+            key="intake_files",
+        )
+        intake_notes = st.text_area(
+            "素材补充说明（可选）",
+            height=120,
+            key="intake_notes",
+            placeholder="例如：photo_01 是全家福，photo_02 是厨房煮粥...",
+        )
+        if st.button("整理成 MV01 JSON", key="intake_to_mv01", use_container_width=True):
+            if not intake_text and not intake_files:
+                st.warning("请先输入文字或上传图片。")
+            else:
+                assets = []
+                extracted_notes = []
+                for idx, file in enumerate(intake_files or [], start=1):
+                    file_bytes = file.getvalue()
+                    ext = Path(file.name).suffix.lower().lstrip(".")
+                    asset_type = "image" if ext in {"png", "jpg", "jpeg", "webp"} else "audio" if ext in {"mp3", "wav", "m4a"} else "video"
+                    asset_id = f"{asset_type}_{idx:02d}"
+                    asset_info: Dict[str, Any] = {
+                        "asset_id": asset_id,
+                        "type": asset_type,
+                        "filename": file.name,
+                    }
+                    if asset_type == "image":
+                        with st.spinner(f"解析图片 {file.name}..."):
+                            description = describe_image(file_bytes, file.name)
+                        asset_info["description"] = description
+                        extracted_notes.append(f"{asset_id}: {description}")
+                    elif asset_type == "audio":
+                        with st.spinner(f"转写音频 {file.name}..."):
+                            transcript = transcribe_audio(file_bytes, file.name)
+                        asset_info["transcript"] = transcript
+                        extracted_notes.append(f"{asset_id} 音频转写: {transcript}")
+                    else:
+                        audio_bytes, err = extract_audio_from_video(file_bytes, f".{ext}")
+                        if audio_bytes:
+                            with st.spinner(f"转写视频音轨 {file.name}..."):
+                                transcript = transcribe_audio(audio_bytes, f"{file.name}.wav")
+                            asset_info["transcript"] = transcript
+                            extracted_notes.append(f"{asset_id} 视频转写: {transcript}")
+                        else:
+                            asset_info["warning"] = err or "视频解析失败"
+                            extracted_notes.append(f"{asset_id} 视频解析失败: {err}")
+                    assets.append(asset_info)
+
+                payload = {
+                    "user_text": intake_text,
+                    "assets": assets,
+                    "notes": intake_notes,
+                    "extracted_notes": "\n".join(extracted_notes),
+                }
+                with st.spinner("正在整理输入信息..."):
+                    result = call_structured(build_intake_prompt(), json.dumps(payload, ensure_ascii=False, indent=2))
+                if result.get("error"):
+                    st.error(result.get("message", "整理失败"))
+                else:
+                    st.session_state["mv01_text_input"] = json.dumps(
+                        result, ensure_ascii=False, indent=2
+                    )
+                    st.success("已生成 MV01 输入 JSON，并填充到下方输入框。")
+
     input_default = json.dumps(sample_inputs, ensure_ascii=False, indent=2)
-    mv01_text = st.text_area("MV01 输入 JSON", value=input_default, height=240)
+    if "mv01_text_input" not in st.session_state:
+        st.session_state["mv01_text_input"] = input_default
+    mv01_text = st.text_area(
+        "MV01 输入 JSON",
+        height=240,
+        key="mv01_text_input",
+    )
     mv01_input, mv01_error = parse_json(mv01_text)
     if mv01_error:
         st.warning(mv01_error)
